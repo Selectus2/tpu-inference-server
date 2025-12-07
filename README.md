@@ -147,6 +147,8 @@ tpu-server serve
 
 ## API Reference
 
+> **Note:** The first request after loading a model will take longer (30-60+ seconds) as XLA compiles the computation graph. Subsequent requests will be much faster.
+
 ### Health Check
 
 ```bash
@@ -433,6 +435,10 @@ pytest
 black src/
 ruff check src/ --fix
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute.
 
 ## License
 
