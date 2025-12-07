@@ -66,6 +66,9 @@ class TPUInferenceServer:
     - "multi": Multi-worker batched mode (Flask threaded=True, dedicated TPU worker)
     """
 
+    # Default sequence lengths for precompilation
+    DEFAULT_PRECOMPILE_LENGTHS = [32, 64, 128, 256, 512]
+
     def __init__(
         self,
         config_path: Optional[str] = None,
@@ -75,6 +78,8 @@ class TPUInferenceServer:
         mode: Literal["single", "multi"] = "single",
         batch_size: int = 4,
         batch_timeout: float = 0.1,
+        precompile: bool = False,
+        precompile_lengths: Optional[List[int]] = None,
     ):
         """
         Initialize the TPU Inference Server.
@@ -87,6 +92,8 @@ class TPUInferenceServer:
             mode: Server mode - "single" (default) or "multi" (batched)
             batch_size: Maximum requests per batch (multi mode only)
             batch_timeout: Seconds to wait for batch to fill (multi mode only)
+            precompile: Enable XLA graph precompilation for common sequence lengths
+            precompile_lengths: Custom sequence lengths to precompile (default: [32, 64, 128, 256, 512])
         """
         self.host = host
         self.port = port
@@ -94,6 +101,8 @@ class TPUInferenceServer:
         self.mode = mode
         self.batch_size = batch_size
         self.batch_timeout = batch_timeout
+        self.precompile = precompile
+        self.precompile_lengths = precompile_lengths or self.DEFAULT_PRECOMPILE_LENGTHS
 
         self.loaded_models: Dict[str, Dict[str, Any]] = {}
         self._device: Optional[Any] = None
@@ -110,6 +119,10 @@ class TPUInferenceServer:
             self.batch_size = server_config["batch_size"]
         if "batch_timeout" in server_config:
             self.batch_timeout = server_config["batch_timeout"]
+        if "precompile" in server_config:
+            self.precompile = server_config["precompile"]
+        if "precompile_lengths" in server_config:
+            self.precompile_lengths = server_config["precompile_lengths"]
 
         # Create Flask app
         self.app = create_app(self)
@@ -185,6 +198,57 @@ class TPUInferenceServer:
 
         log_progress(f"Warmup complete for {model_name}")
 
+    def precompile_model(
+        self, model: Any, tokenizer: Any, model_name: str
+    ) -> None:
+        """
+        Precompile XLA graphs for common sequence lengths.
+
+        This reduces latency for the first request of each sequence length
+        by compiling XLA graphs during startup instead of at request time.
+
+        Args:
+            model: The loaded model
+            tokenizer: The model's tokenizer
+            model_name: Name of the model for logging
+        """
+        if not self.precompile:
+            return
+
+        if not XLA_AVAILABLE:
+            log_progress("Precompilation skipped (XLA not available)")
+            return
+
+        log_progress(f"Precompiling XLA graphs for {model_name}...")
+        log_progress(f"  Sequence lengths: {self.precompile_lengths}")
+
+        pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+
+        for seq_len in self.precompile_lengths:
+            start_time = time.time()
+
+            # Create dummy input of this length
+            dummy_input = torch.full(
+                (1, seq_len), pad_token_id, dtype=torch.long, device=self.device
+            )
+            dummy_mask = torch.ones((1, seq_len), dtype=torch.long, device=self.device)
+
+            try:
+                with torch.no_grad():
+                    # Forward pass to compile the graph
+                    outputs = model(input_ids=dummy_input, attention_mask=dummy_mask)
+                    # Access logits to ensure computation completes
+                    _ = outputs.logits[:, -1, :]
+                    xm.mark_step()
+
+                elapsed = time.time() - start_time
+                log_progress(f"  Precompiled seq_len={seq_len} in {elapsed:.1f}s")
+
+            except Exception as e:
+                log_progress(f"  Failed to precompile seq_len={seq_len}: {e}")
+
+        log_progress(f"Precompilation complete for {model_name}")
+
     def load_model(
         self, model_id: str, name: Optional[str] = None, dtype: str = "bfloat16"
     ) -> Dict[str, Any]:
@@ -237,6 +301,9 @@ class TPUInferenceServer:
 
         # Warmup
         self.warmup_model(model, tokenizer, name)
+
+        # Precompile XLA graphs for common sequence lengths
+        self.precompile_model(model, tokenizer, name)
 
         model_info = {
             "model": model,

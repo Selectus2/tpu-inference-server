@@ -114,6 +114,19 @@ For more information, see: https://github.com/yourusername/tpu-inference-server
         help="Enable debug mode (not recommended for TPU)",
     )
 
+    # Precompilation options
+    serve_parser.add_argument(
+        "--precompile",
+        action="store_true",
+        help="Precompile XLA graphs for common sequence lengths (slower startup, faster first requests)",
+    )
+    serve_parser.add_argument(
+        "--precompile-lengths",
+        type=str,
+        default=None,
+        help="Comma-separated sequence lengths to precompile (default: 32,64,128,256,512)",
+    )
+
     # Init-config command
     init_parser = subparsers.add_parser("init-config", help="Generate example config file")
     init_parser.add_argument(
@@ -140,7 +153,7 @@ For more information, see: https://github.com/yourusername/tpu-inference-server
         "--version",
         "-v",
         action="version",
-        version="%(prog)s 0.1.0",
+        version="%(prog)s 0.1.3",
     )
 
     return parser
@@ -150,6 +163,11 @@ def cmd_serve(args: argparse.Namespace) -> int:
     """Run the serve command."""
     from tpu_inference_server.server import TPUInferenceServer
 
+    # Parse precompile lengths if provided
+    precompile_lengths = None
+    if args.precompile_lengths:
+        precompile_lengths = [int(x.strip()) for x in args.precompile_lengths.split(",")]
+
     server = TPUInferenceServer(
         config_path=args.config if Path(args.config).exists() else None,
         host=args.host,
@@ -158,6 +176,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         mode=args.mode,
         batch_size=args.batch_size,
         batch_timeout=args.batch_timeout,
+        precompile=args.precompile,
+        precompile_lengths=precompile_lengths,
     )
 
     # Load model from command line if specified
@@ -185,6 +205,10 @@ server:
   mode: "multi"           # "single" or "multi"
   batch_size: 4           # Max requests per batch
   batch_timeout: 0.1      # Seconds to wait for batch to fill
+
+  # XLA Precompilation (slower startup, faster first requests)
+  precompile: true
+  precompile_lengths: [32, 64, 128, 256, 512]
 
 # Models to load on startup
 models:
@@ -215,6 +239,11 @@ server:
   # mode: "multi"
   # batch_size: 4
   # batch_timeout: 0.1
+
+  # XLA Precompilation (slower startup, faster first requests)
+  # Uncomment to enable:
+  # precompile: true
+  # precompile_lengths: [32, 64, 128, 256, 512]
 
 # Models to load on startup
 # Comment out models you don't want to load automatically
