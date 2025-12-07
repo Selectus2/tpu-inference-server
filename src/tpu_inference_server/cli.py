@@ -153,7 +153,7 @@ For more information, see: https://github.com/yourusername/tpu-inference-server
         "--version",
         "-v",
         action="version",
-        version="%(prog)s 0.1.3",
+        version="%(prog)s 0.1.4",
     )
 
     return parser

@@ -246,6 +246,35 @@ Response:
 }
 ```
 
+### Streaming Chat Completions
+
+Enable streaming with `"stream": true` to receive tokens as they're generated:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mistral-7b",
+    "messages": [
+      {"role": "user", "content": "Hello, how are you?"}
+    ],
+    "max_tokens": 50,
+    "stream": true
+  }'
+```
+
+Streaming Response (Server-Sent Events):
+```
+data: {"id": "chatcmpl-1705312200", "object": "chat.completion.chunk", "created": 1705312200, "model": "mistral-7b", "choices": [{"index": 0, "delta": {"content": "Hello"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-1705312200", "object": "chat.completion.chunk", "created": 1705312200, "model": "mistral-7b", "choices": [{"index": 0, "delta": {"content": "!"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-1705312200", "object": "chat.completion.chunk", "created": 1705312200, "model": "mistral-7b", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+
+data: [DONE]
+```
+
 ### OpenAI-Compatible Models List
 
 ```bash

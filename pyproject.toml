@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tpu-inference-server"
-version = "0.1.3"
+version = "0.1.4"
 description = "A Flask-based inference server optimized for Google Cloud TPU v5e"
 readme = "README.md"
 license = {text = "MIT"}
