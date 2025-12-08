@@ -19,9 +19,10 @@ import sys
 import time
 import logging
 import gc
+import json
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Literal
+from typing import Dict, Any, Optional, List, Literal, Generator
 
 # Set PJRT_DEVICE before importing torch_xla
 os.environ.setdefault("PJRT_DEVICE", "TPU")
@@ -66,6 +67,9 @@ class TPUInferenceServer:
     - "multi": Multi-worker batched mode (Flask threaded=True, dedicated TPU worker)
     """
 
+    # Default sequence lengths for precompilation
+    DEFAULT_PRECOMPILE_LENGTHS = [32, 64, 128, 256, 512]
+
     def __init__(
         self,
         config_path: Optional[str] = None,
@@ -75,6 +79,8 @@ class TPUInferenceServer:
         mode: Literal["single", "multi"] = "single",
         batch_size: int = 4,
         batch_timeout: float = 0.1,
+        precompile: bool = False,
+        precompile_lengths: Optional[List[int]] = None,
     ):
         """
         Initialize the TPU Inference Server.
@@ -87,6 +93,8 @@ class TPUInferenceServer:
             mode: Server mode - "single" (default) or "multi" (batched)
             batch_size: Maximum requests per batch (multi mode only)
             batch_timeout: Seconds to wait for batch to fill (multi mode only)
+            precompile: Enable XLA graph precompilation for common sequence lengths
+            precompile_lengths: Custom sequence lengths to precompile (default: [32, 64, 128, 256, 512])
         """
         self.host = host
         self.port = port
@@ -94,6 +102,8 @@ class TPUInferenceServer:
         self.mode = mode
         self.batch_size = batch_size
         self.batch_timeout = batch_timeout
+        self.precompile = precompile
+        self.precompile_lengths = precompile_lengths or self.DEFAULT_PRECOMPILE_LENGTHS
 
         self.loaded_models: Dict[str, Dict[str, Any]] = {}
         self._device: Optional[Any] = None
@@ -110,6 +120,10 @@ class TPUInferenceServer:
             self.batch_size = server_config["batch_size"]
         if "batch_timeout" in server_config:
             self.batch_timeout = server_config["batch_timeout"]
+        if "precompile" in server_config:
+            self.precompile = server_config["precompile"]
+        if "precompile_lengths" in server_config:
+            self.precompile_lengths = server_config["precompile_lengths"]
 
         # Create Flask app
         self.app = create_app(self)
@@ -185,6 +199,57 @@ class TPUInferenceServer:
 
         log_progress(f"Warmup complete for {model_name}")
 
+    def precompile_model(
+        self, model: Any, tokenizer: Any, model_name: str
+    ) -> None:
+        """
+        Precompile XLA graphs for common sequence lengths.
+
+        This reduces latency for the first request of each sequence length
+        by compiling XLA graphs during startup instead of at request time.
+
+        Args:
+            model: The loaded model
+            tokenizer: The model's tokenizer
+            model_name: Name of the model for logging
+        """
+        if not self.precompile:
+            return
+
+        if not XLA_AVAILABLE:
+            log_progress("Precompilation skipped (XLA not available)")
+            return
+
+        log_progress(f"Precompiling XLA graphs for {model_name}...")
+        log_progress(f"  Sequence lengths: {self.precompile_lengths}")
+
+        pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+
+        for seq_len in self.precompile_lengths:
+            start_time = time.time()
+
+            # Create dummy input of this length
+            dummy_input = torch.full(
+                (1, seq_len), pad_token_id, dtype=torch.long, device=self.device
+            )
+            dummy_mask = torch.ones((1, seq_len), dtype=torch.long, device=self.device)
+
+            try:
+                with torch.no_grad():
+                    # Forward pass to compile the graph
+                    outputs = model(input_ids=dummy_input, attention_mask=dummy_mask)
+                    # Access logits to ensure computation completes
+                    _ = outputs.logits[:, -1, :]
+                    xm.mark_step()
+
+                elapsed = time.time() - start_time
+                log_progress(f"  Precompiled seq_len={seq_len} in {elapsed:.1f}s")
+
+            except Exception as e:
+                log_progress(f"  Failed to precompile seq_len={seq_len}: {e}")
+
+        log_progress(f"Precompilation complete for {model_name}")
+
     def load_model(
         self, model_id: str, name: Optional[str] = None, dtype: str = "bfloat16"
     ) -> Dict[str, Any]:
@@ -237,6 +302,9 @@ class TPUInferenceServer:
 
         # Warmup
         self.warmup_model(model, tokenizer, name)
+
+        # Precompile XLA graphs for common sequence lengths
+        self.precompile_model(model, tokenizer, name)
 
         model_info = {
             "model": model,
@@ -583,6 +651,102 @@ def generate_tokens(
     return generated_text
 
 
+def generate_tokens_stream(
+    model: Any,
+    tokenizer: Any,
+    prompt: str,
+    device: Any,
+    max_new_tokens: int = 50,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    stop_sequences: Optional[List[str]] = None,
+):
+    """
+    Generate tokens with streaming (yields tokens as they're generated).
+
+    Args:
+        model: The loaded model
+        tokenizer: The model's tokenizer
+        prompt: Input text prompt
+        device: Torch device
+        max_new_tokens: Maximum tokens to generate
+        temperature: Sampling temperature
+        top_p: Nucleus sampling probability
+        stop_sequences: Sequences that stop generation
+
+    Yields:
+        Generated token strings one at a time
+    """
+    inputs = tokenizer(prompt, return_tensors="pt")
+    input_ids = inputs["input_ids"].to(device)
+    attention_mask = inputs["attention_mask"].to(device)
+
+    generated_tokens = []
+    stop_sequences = stop_sequences or []
+
+    for i in range(max_new_tokens):
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs.logits[:, -1, :].float()
+
+            if temperature > 0:
+                logits = logits / temperature
+
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.cumsum(
+                        torch.softmax(sorted_logits, dim=-1), dim=-1
+                    )
+
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
+                        ..., :-1
+                    ].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+
+                    indices_to_remove = sorted_indices_to_remove.scatter(
+                        1, sorted_indices, sorted_indices_to_remove
+                    )
+                    logits[indices_to_remove] = float("-inf")
+
+                probs = torch.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+
+            if XLA_AVAILABLE:
+                xm.mark_step()
+
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
+            attention_mask = torch.cat(
+                [
+                    attention_mask,
+                    torch.ones(
+                        (attention_mask.shape[0], 1),
+                        device=device,
+                        dtype=attention_mask.dtype,
+                    ),
+                ],
+                dim=-1,
+            )
+
+            token_id = next_token.item()
+            generated_tokens.append(token_id)
+
+            # Decode just this token
+            token_text = tokenizer.decode([token_id], skip_special_tokens=True)
+
+            # Yield the token
+            yield token_text
+
+            if token_id == tokenizer.eos_token_id:
+                break
+
+            current_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            if any(stop_seq in current_text for stop_seq in stop_sequences):
+                break
+
+
 def format_chat_messages(messages: List[Dict[str, str]], tokenizer: Any) -> str:
     """
     Format chat messages into a prompt string.
@@ -774,7 +938,7 @@ def create_app(server: "TPUInferenceServer") -> Flask:
 
     @app.route("/v1/chat/completions", methods=["POST"])
     def openai_chat_completions() -> Response:
-        """OpenAI-compatible chat completions endpoint."""
+        """OpenAI-compatible chat completions endpoint with streaming support."""
         try:
             data = request.get_json()
             model_name = data.get("model")
@@ -783,6 +947,7 @@ def create_app(server: "TPUInferenceServer") -> Flask:
             temperature = data.get("temperature", 0.7)
             top_p = data.get("top_p", 0.9)
             stop = data.get("stop", [])
+            stream = data.get("stream", False)
 
             if not messages:
                 return (
@@ -832,19 +997,76 @@ def create_app(server: "TPUInferenceServer") -> Flask:
 
             # Format messages
             prompt = format_chat_messages(messages, model_info["tokenizer"])
+            stop_sequences = stop if isinstance(stop, list) else [stop] if stop else None
 
-            log_progress(f"Chat request: model={model_name}, max_tokens={max_tokens}")
+            log_progress(f"Chat request: model={model_name}, max_tokens={max_tokens}, stream={stream}")
 
-            # Generate response
+            # Streaming response
+            if stream:
+                def generate_stream():
+                    chat_id = f"chatcmpl-{int(time.time())}"
+                    created = int(time.time())
+
+                    for token in generate_tokens_stream(
+                        model=model_info["model"],
+                        tokenizer=model_info["tokenizer"],
+                        prompt=prompt,
+                        device=server.device,
+                        max_new_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stop_sequences=stop_sequences,
+                    ):
+                        chunk = {
+                            "id": chat_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {"content": token},
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n"
+
+                    # Send final chunk with finish_reason
+                    final_chunk = {
+                        "id": chat_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                    yield f"data: {json.dumps(final_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+
+                return Response(
+                    generate_stream(),
+                    mimetype="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+
+            # Non-streaming response
             generated_text = server.generate(
                 prompt=prompt,
                 model_name=model_name,
                 max_new_tokens=max_tokens,
                 temperature=temperature,
                 top_p=top_p,
-                stop_sequences=(
-                    stop if isinstance(stop, list) else [stop] if stop else None
-                ),
+                stop_sequences=stop_sequences,
             )
 
             response = {

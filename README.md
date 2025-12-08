@@ -246,6 +246,35 @@ Response:
 }
 ```
 
+### Streaming Chat Completions
+
+Enable streaming with `"stream": true` to receive tokens as they're generated:
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mistral-7b",
+    "messages": [
+      {"role": "user", "content": "Hello, how are you?"}
+    ],
+    "max_tokens": 50,
+    "stream": true
+  }'
+```
+
+Streaming Response (Server-Sent Events):
+```
+data: {"id": "chatcmpl-1705312200", "object": "chat.completion.chunk", "created": 1705312200, "model": "mistral-7b", "choices": [{"index": 0, "delta": {"content": "Hello"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-1705312200", "object": "chat.completion.chunk", "created": 1705312200, "model": "mistral-7b", "choices": [{"index": 0, "delta": {"content": "!"}, "finish_reason": null}]}
+
+data: {"id": "chatcmpl-1705312200", "object": "chat.completion.chunk", "created": 1705312200, "model": "mistral-7b", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+
+data: [DONE]
+```
+
 ### OpenAI-Compatible Models List
 
 ```bash
@@ -273,14 +302,17 @@ models:
 tpu-server serve --help
 
 Options:
-  --config, -c     Path to config file (default: config.yaml)
-  --host           Host to bind (default: 0.0.0.0)
-  --port, -p       Port to bind (default: 8080)
-  --model, -m      Model ID to load on startup
-  --model-name     Name for the model
-  --dtype          Data type: bfloat16, float32, float16 (default: bfloat16)
-  --no-warmup      Skip warmup step on model load
-  --debug          Enable debug mode
+  --config, -c         Path to config file (default: config.yaml)
+  --host               Host to bind (default: 0.0.0.0)
+  --port, -p           Port to bind (default: 8080)
+  --model, -m          Model ID to load on startup
+  --model-name         Name for the model
+  --dtype              Data type: bfloat16, float32, float16 (default: bfloat16)
+  --mode               Server mode: single or multi (default: single)
+  --no-warmup          Skip warmup step on model load
+  --precompile         Precompile XLA graphs for faster first requests
+  --precompile-lengths Comma-separated sequence lengths (default: 32,64,128,256,512)
+  --debug              Enable debug mode
 ```
 
 ## External Access
@@ -336,6 +368,71 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+## Server Modes
+
+The server supports two modes:
+
+| Mode | Command | Best For |
+|------|---------|----------|
+| Single | `--mode single` (default) | Reliability, single user, debugging |
+| Multi | `--mode multi` | Multiple concurrent users |
+
+### Single Mode (Recommended for TPU)
+
+```bash
+tpu-server serve --model mistralai/Mistral-7B-Instruct-v0.2 --model-name mistral-7b --dtype bfloat16 --mode single
+```
+
+- Processes one request at a time
+- Most reliable for TPU/XLA
+- Subsequent requests queue and wait (don't hang)
+
+### Multi Mode (Batched)
+
+```bash
+tpu-server serve --model mistralai/Mistral-7B-Instruct-v0.2 --model-name mistral-7b --dtype bfloat16 --mode multi --batch-size 4 --batch-timeout 0.1
+```
+
+- Batches concurrent requests together
+- Better throughput for multiple users
+- Uses dedicated TPU worker thread
+
+## XLA Precompilation
+
+XLA compiles computation graphs on first use, causing slow first requests (30-60+ seconds). Precompilation moves this cost to startup time.
+
+### Enable Precompilation
+
+```bash
+tpu-server serve --model mistralai/Mistral-7B-Instruct-v0.2 --model-name mistral-7b --dtype bfloat16 --precompile
+```
+
+### Custom Sequence Lengths
+
+```bash
+tpu-server serve --model mistralai/Mistral-7B-Instruct-v0.2 --model-name mistral-7b --dtype bfloat16 --precompile --precompile-lengths 64,128,256
+```
+
+### Via Config File
+
+```yaml
+server:
+  host: "0.0.0.0"
+  port: 8080
+  precompile: true
+  precompile_lengths: [32, 64, 128, 256, 512]
+```
+
+### Trade-offs
+
+| Setting | Startup Time | First Request |
+|---------|--------------|---------------|
+| No precompile | ~2 min | 30-60s |
+| Precompile (5 lengths) | ~7-10 min | 2-5s |
+| Precompile (3 lengths) | ~5-7 min | 2-5s (for matching lengths) |
+
+Precompilation is recommended for production deployments where fast response times are critical.
+
 ## Troubleshooting
 
 ### "No TPU devices found"
@@ -358,7 +455,61 @@ gcloud compute tpus tpu-vm describe my-tpu --zone=us-central1-a
 
 ### Slow first request
 
-This is normal - XLA needs to compile the graph. The warmup step reduces this, but the first real request may still be slower.
+This is normal - XLA needs to compile the computation graph. The first request after loading a model will take 30-60+ seconds. Subsequent requests will be much faster (2-10 seconds).
+
+### "TPU initialization failed: Device or resource busy"
+
+The TPU is held by another process. Kill existing processes:
+
+```bash
+pkill -f tpu-server
+pkill -f "python.*tpu"
+
+# Or find and kill specific PID
+ps aux | grep tpu-server
+kill -9 <PID>
+```
+
+Wait a few seconds before restarting the server.
+
+**Important:** Do not use the `--debug` flag with TPU - Flask's debug mode uses a reloader that tries to start two processes, causing TPU conflicts.
+
+### Wrong PyTorch version (CUDA instead of TPU)
+
+Check your PyTorch version:
+```bash
+python -c "import torch; print(torch.__version__)"
+```
+
+If you see `+cu121` or similar CUDA suffix, you have the wrong version. Reinstall:
+
+```bash
+pip uninstall torch torch_xla -y
+pip install torch torch_xla \
+  -f https://storage.googleapis.com/libtpu-releases/index.html \
+  -f https://storage.googleapis.com/libtpu-wheels/index.html
+```
+
+Verify TPU is accessible:
+```bash
+python -c "import torch_xla.core.xla_model as xm; print(f'TPU device: {xm.xla_device()}')"
+```
+
+### Request timeout / hanging
+
+1. Start with a smaller model to verify setup:
+   ```bash
+   tpu-server serve --model gpt2 --model-name gpt2 --dtype float32 --mode single
+   ```
+
+2. Test with minimal tokens:
+   ```bash
+   curl http://localhost:8080/generate \
+     -X POST -H "Content-Type: application/json" \
+     -d '{"inputs": "Hello", "model": "gpt2", "max_new_tokens": 5}'
+   ```
+
+3. If GPT-2 works, try larger models. If it hangs, check TPU device and PyTorch version.
 
 ### "XLA compilation failed"
 
@@ -374,6 +525,136 @@ pip install torch torch_xla \
 For gated models (Llama 2), you need to:
 1. Accept the license on HuggingFace
 2. Login: `huggingface-cli login`
+
+## Production Deployment
+
+The default Flask server shows this warning:
+```
+WARNING: This is a development server. Do not use it in a production deployment.
+```
+
+For production use, consider the following options:
+
+### Option 1: Gunicorn (Recommended)
+
+```bash
+pip install gunicorn
+```
+
+Run with a single worker (required for TPU):
+
+```bash
+gunicorn "tpu_inference_server.server:create_app()" \
+  --bind 0.0.0.0:8080 \
+  --workers 1 \
+  --threads 1 \
+  --timeout 300
+```
+
+**Note:** You need to load the model before starting. Create a startup script:
+
+```python
+# start_server.py
+from tpu_inference_server import TPUInferenceServer
+
+server = TPUInferenceServer(host="0.0.0.0", port=8080, mode="single")
+server.load_model("mistralai/Mistral-7B-Instruct-v0.2", "mistral-7b", "bfloat16")
+app = server.app
+
+if __name__ == "__main__":
+    server.run()
+```
+
+Then run:
+```bash
+gunicorn "start_server:app" --bind 0.0.0.0:8080 --workers 1 --timeout 300
+```
+
+### Option 2: Reverse Proxy with Nginx
+
+Run the Flask server behind Nginx for SSL termination and rate limiting:
+
+```nginx
+upstream tpu_server {
+    server 127.0.0.1:8080;
+}
+
+server {
+    listen 443 ssl;
+    server_name your-domain.com;
+
+    ssl_certificate /path/to/cert.pem;
+    ssl_certificate_key /path/to/key.pem;
+
+    location / {
+        proxy_pass http://tpu_server;
+        proxy_read_timeout 300s;
+        proxy_connect_timeout 75s;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+```
+
+### Option 3: Systemd Service
+
+Create `/etc/systemd/system/tpu-inference.service`:
+
+```ini
+[Unit]
+Description=TPU Inference Server
+After=network.target
+
+[Service]
+Type=simple
+User=your-user
+WorkingDirectory=/home/your-user
+ExecStart=/home/your-user/miniconda3/envs/tpu/bin/tpu-server serve \
+    --model mistralai/Mistral-7B-Instruct-v0.2 \
+    --model-name mistral-7b \
+    --dtype bfloat16 \
+    --mode single
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable tpu-inference
+sudo systemctl start tpu-inference
+sudo systemctl status tpu-inference
+```
+
+### Option 4: Multiple Instances with Load Balancer
+
+For higher throughput, run multiple TPU VMs behind a load balancer:
+
+```bash
+# On each TPU VM
+tpu-server serve --model mistralai/Mistral-7B-Instruct-v0.2 --model-name mistral-7b --dtype bfloat16 --port 8080
+```
+
+Use Google Cloud Load Balancer or HAProxy to distribute requests.
+
+### Security Recommendations
+
+1. **Firewall**: Restrict access to trusted IPs only
+   ```bash
+   gcloud compute firewall-rules create allow-inference-restricted \
+     --allow tcp:8080 \
+     --source-ranges="YOUR_IP/32" \
+     --description="Restricted inference server access"
+   ```
+
+2. **API Authentication**: Add an API key check in front of the server (via Nginx or a wrapper)
+
+3. **Rate Limiting**: Use Nginx or a cloud WAF to prevent abuse
+
+4. **Monitoring**: Set up logging and alerts for errors and latency
 
 ## Cleanup
 
